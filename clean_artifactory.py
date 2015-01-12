@@ -7,6 +7,7 @@ import datetime
 from dateutil.parser import parse
 import requests
 from requests.auth import HTTPBasicAuth
+import concurrent.futures as futures
 import simplejson as json
 from operator import itemgetter, attrgetter
 
@@ -17,7 +18,8 @@ config = {
     'user': None,
     'pass': None,
     'maven_group': None,
-    'time_delay': 45
+    'time_delay': 14,
+    'regex_match': "\d{4}.\d{2}.\d{2}-"
 }
 
 opts, args = getopt.getopt(sys.argv[1:], 's:r:dg:t:', ['server=', 'repository=', 'dryRun', 'group=', 'time_delay='])
@@ -36,6 +38,8 @@ for opt, arg in opts:
         config['maven_group'] = arg
     elif opt in ('-t', '--time_delay'):
         config['time_delay'] = int(arg)
+    elif opt in ('-e', '--regex'):
+        config['regex_match'] = arg
 
 if not config['maven_group']:
     print "You must provide the group please use -g or --group to define."
@@ -82,31 +86,43 @@ class Artifactory:
             else:
                 print "requests.delete(\"{0}{1}/{2}\")".format(self.config['server'], '/artifactory/' + self.config['repository'], child.full_path)
         else:
-            print "{0} was not older than 45 days.".format(child.full_path)
+            print "{} was not older than {} days.".format(child.full_path, self.config['time_delay'])
 
     def is_artifact_folder(self, child):
-        return "-SNAPSHOT" in child['uri']
+        return re.search(config['regex_match'], child['uri'])
 
-    def get_artifact_folders(self):
-        path = self.config['maven_group']
+    def _get_folder_call(self, child, path):
+        children = []
+        if child['folder']:
+            if self.is_artifact_folder(child):
+                child_holder = DictHolder(child)
+                first_sort = re.sub(r'[-.]', '', path)
+                number = re.sub(r'[^\d]+', '', child['uri'])
+                second_sort = int(number) if number else 0
+                full_path = path + child['uri']
+
+                setattr(child_holder, 'first_sort', first_sort)
+                setattr(child_holder, 'second_sort', second_sort)
+                setattr(child_holder, 'full_path', full_path)
+
+                children.append(child_holder)
+            else:
+                if not 'ro-scripts' in child['uri']:
+                    children = children + self.get_artifact_folders(path + child['uri'])
+        return children
+
+    def get_artifact_folders(self, path=None):
+        path = self.config['maven_group'] if not path else path
         children = []
         json_data = self.folder_info(path)
-        for child in json_data['children']:
-            if child['folder']:
-                if self.is_artifact_folder(child):
-                    child_holder = DictHolder(child)
-                    first_sort = re.sub(r'[-.]', '', path)
-                    second_sort = int(re.sub(r'[^\d]+', '', child['uri']))
-                    full_path = path + child['uri']
+        future_child_check = {}
+        with futures.ThreadPoolExecutor(max_workers=5) as executor:
+            for child in json_data['children']:
+                future_child_check[executor.submit(self._get_folder_call, child, path)] = child
+            for future in futures.as_completed(future_child_check):
+                result = future.result()
+                children = children + result
 
-                    setattr(child_holder, 'first_sort', first_sort)
-                    setattr(child_holder, 'second_sort', second_sort)
-                    setattr(child_holder, 'full_path', full_path)
-
-                    children.append(child_holder)
-                else:
-                    if not 'ro-scripts' in child['uri']:
-                        children = children + self.get_artifact_folders(path + child['uri'])
         return children
 
 
@@ -140,5 +156,9 @@ print "Left Over\n-----------------------\n"
 for left in left_over:
     print left.full_path
 print "-----------------------\nRemove\n------------------\n"
-for remove in to_be_removed:
-    artifactory.remove_child(remove)
+future_to_remove = {}
+with futures.ThreadPoolExecutor(max_workers=15) as executor:
+    for remove in to_be_removed:
+        future_to_remove[executor.submit(artifactory.remove_child, remove)] = remove
+    for future in futures.as_completed(future_to_remove):
+        result = future.result()
